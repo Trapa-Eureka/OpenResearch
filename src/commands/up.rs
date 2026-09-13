@@ -36,6 +36,7 @@ use crate::commands::remote_host::{DashboardLock, DashboardLockMode, HostDescrip
 use crate::error::{anyhow, Result};
 use crate::local;
 use crate::local::chat::ChatHost;
+use crate::local::is_terminal;
 use crate::local::opencode::AgentHost;
 use crate::store::{
     log_path, now_ms, SshHostTest, Store, StoredAgentSelection, StoredChatSession, StoredRun,
@@ -7639,10 +7640,6 @@ fn push_log_delta(
             "offset": offset,
         }),
     ));
-}
-
-fn is_terminal(status: &str) -> bool {
-    matches!(status, "done" | "failed" | "cancelled")
 }
 
 fn log_size(run_id: &str) -> u64 {
