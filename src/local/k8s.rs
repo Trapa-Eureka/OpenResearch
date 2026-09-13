@@ -191,6 +191,7 @@ pub async fn submit_local_k8s_with_source(
         chat_session_id: args.launching_chat_session(),
         recovery_reason: None,
         error_kind: None,
+        provenance_json: None,
     };
     store.upsert_run(&run)?;
 
