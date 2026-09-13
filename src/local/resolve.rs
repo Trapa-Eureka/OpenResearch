@@ -93,6 +93,7 @@ mod tests {
             cancel_requested: false,
             chat_session_id: None,
             recovery_reason: None,
+            error_kind: None,
         }
     }
 

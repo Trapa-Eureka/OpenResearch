@@ -62,7 +62,9 @@ async fn give_up_on_unreachable_backend(
          consecutive polls (roughly {} minutes) — last error: {last_error}",
         u64::from(MAX_CONSECUTIVE_INSPECT_FAILURES) * POLL_INTERVAL.as_secs() / 60,
     );
-    if let Err(err) = store.mark_run_unrecoverable(run_id, &reason) {
+    if let Err(err) =
+        store.mark_run_unrecoverable(run_id, crate::error::ErrorKind::BackendUnavailable, &reason)
+    {
         eprintln!("supervise {run_id}: could not mark run unrecoverable: {err}");
     }
     let _ = done_tx.send(true);
@@ -1502,6 +1504,7 @@ mod tests {
             cancel_requested: false,
             chat_session_id: None,
             recovery_reason: None,
+            error_kind: None,
         };
         store.upsert_run(&run).unwrap();
 
@@ -1595,6 +1598,60 @@ mod tests {
         drop(holder);
 
         assert!(!probe_supervisor_lock(&path).unwrap());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// TASK 5 (error classification): giving up on an unreachable backend
+    /// stamps the stable `BackendUnavailable` code alongside the free-text
+    /// reason, going through the same terminal-state guard as every other
+    /// path to `Failed` — a real completion racing the give-up must win.
+    #[tokio::test]
+    async fn give_up_on_unreachable_backend_stamps_backend_unavailable() {
+        let dir = std::env::temp_dir().join(format!(
+            "orx-supervise-giveup-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .upsert_run(&StoredRun {
+                id: "run-1".into(),
+                experiment_id: "experiment-1".into(),
+                project_id: "project-1".into(),
+                status: "running".into(),
+                backend_json: "{}".into(),
+                command: String::new(),
+                created_at: 1,
+                updated_at: 1,
+                ended_at: None,
+                exit_code: None,
+                commit_sha: None,
+                result_markdown: None,
+                cancel_requested: false,
+                chat_session_id: None,
+                recovery_reason: None,
+                error_kind: None,
+            })
+            .unwrap();
+
+        let (done_tx, _done_rx) = tokio::sync::watch::channel(false);
+        let log_task = tokio::spawn(async {});
+        let synthetic_error = anyhow!("connection refused");
+
+        give_up_on_unreachable_backend(
+            &store,
+            "run-1",
+            "ssh",
+            &synthetic_error,
+            &done_tx,
+            log_task,
+        )
+        .await;
+
+        let run = store.get_run("run-1").unwrap().unwrap();
+        assert_eq!(run.status, "failed");
+        assert_eq!(run.error_kind.as_deref(), Some("backend_unavailable"));
+        assert!(run.recovery_reason.unwrap().contains("ssh backend"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

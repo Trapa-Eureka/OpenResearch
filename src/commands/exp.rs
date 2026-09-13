@@ -233,7 +233,11 @@ fn reconcile_active_runs_with(
                     "orx could not start a supervisor process for this run after \
                      {count} attempts and is giving up: {err}"
                 );
-                if let Err(mark_err) = store.mark_run_unrecoverable(&run.id, &reason) {
+                if let Err(mark_err) = store.mark_run_unrecoverable(
+                    &run.id,
+                    crate::error::ErrorKind::Reconciliation,
+                    &reason,
+                ) {
                     eprintln!(
                         "reconcile: could not mark run {} unrecoverable: {mark_err}",
                         run.id
@@ -312,6 +316,7 @@ mod tests {
             cancel_requested: false,
             chat_session_id: None,
             recovery_reason: None,
+            error_kind: None,
         }
     }
 
@@ -555,6 +560,7 @@ mod tests {
             .recovery_reason
             .unwrap()
             .contains("synthetic spawn failure"));
+        assert_eq!(run.error_kind.as_deref(), Some("reconciliation_failure"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

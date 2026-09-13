@@ -9084,6 +9084,7 @@ mod run_wakeup_tests {
             cancel_requested: false,
             chat_session_id: Some("owner".into()),
             recovery_reason: None,
+            error_kind: None,
         }
     }
 
