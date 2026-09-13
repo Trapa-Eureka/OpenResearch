@@ -25,6 +25,56 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long a silent log stream is held before re-checking job state.
 const LOG_IDLE: Duration = Duration::from_secs(30);
 
+/// How many consecutive inspect-transport failures (host unreachable,
+/// cluster API down, auth expired) a poll loop tolerates before giving up on
+/// a run, rather than retrying every `POLL_INTERVAL` forever — roughly 10
+/// minutes at the default interval. Long enough to ride out a flaky network
+/// blip or a brief control-plane restart; short enough that a genuinely
+/// unreachable backend doesn't strand a run in `Running` indefinitely (TASK
+/// 4: every backend's poll loop honors this bound uniformly, where before
+/// each retried forever with no cap).
+const MAX_CONSECUTIVE_INSPECT_FAILURES: u32 = 120;
+
+/// Records one inspect-transport failure and reports whether the run should
+/// now be given up on. `consecutive_failures` is owned by the poll loop and
+/// must be reset to 0 by the caller on the next successful inspect.
+fn record_inspect_failure(consecutive_failures: &mut u32) -> bool {
+    *consecutive_failures += 1;
+    *consecutive_failures >= MAX_CONSECUTIVE_INSPECT_FAILURES
+}
+
+/// Gives up on a run whose backend has been unreachable for
+/// [`MAX_CONSECUTIVE_INSPECT_FAILURES`] consecutive polls: marks it
+/// unrecoverable (TASK 2's `mark_run_unrecoverable`, which never overwrites a
+/// run that reached a real outcome first) and stops the log tail. Shared by
+/// every poll loop so the bound and its bookkeeping can't drift between
+/// backends.
+async fn give_up_on_unreachable_backend(
+    store: &Store,
+    run_id: &str,
+    backend_label: &str,
+    last_error: &crate::error::Error,
+    done_tx: &tokio::sync::watch::Sender<bool>,
+    mut log_task: tokio::task::JoinHandle<()>,
+) {
+    let reason = format!(
+        "the {backend_label} backend has been unreachable for {MAX_CONSECUTIVE_INSPECT_FAILURES} \
+         consecutive polls (roughly {} minutes) — last error: {last_error}",
+        u64::from(MAX_CONSECUTIVE_INSPECT_FAILURES) * POLL_INTERVAL.as_secs() / 60,
+    );
+    if let Err(err) = store.mark_run_unrecoverable(run_id, &reason) {
+        eprintln!("supervise {run_id}: could not mark run unrecoverable: {err}");
+    }
+    let _ = done_tx.send(true);
+    if tokio::time::timeout(Duration::from_secs(20), &mut log_task)
+        .await
+        .is_err()
+    {
+        log_task.abort();
+    }
+    eprintln!("supervise {run_id}: giving up — {reason}");
+}
+
 fn open_supervisor_lock(path: &std::path::Path) -> Result<fd_lock::RwLock<std::fs::File>> {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -153,18 +203,27 @@ pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
 
     let mut last_status = status_of(&stored);
     let mut cancel_sent = false;
+    let mut consecutive_failures = 0u32;
 
     loop {
         // Where is the job now?
         let job = match hf::inspect_job(&token, &namespace, &job_id).await {
-            Ok(j) => j,
+            Ok(j) => {
+                consecutive_failures = 0;
+                j.state()
+            }
             Err(err) => {
                 eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
+                if record_inspect_failure(&mut consecutive_failures) {
+                    give_up_on_unreachable_backend(&store, &run_id, "hf", &err, &done_tx, log_task)
+                        .await;
+                    return Ok(());
+                }
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
         };
-        let stage = job.status.stage.as_str();
+        let stage = job.stage.as_str();
         let status = run_status_for_stage(&store, &run_id, cancel_sent, stage);
 
         // Drain the tail before the status flip so terminal readers see the
@@ -172,7 +231,7 @@ pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
         if is_terminal_stage(stage) {
             store.update_status(&run_id, status, Some(now_ms()), None)?;
             if status == RunStatus::Failed {
-                if let Some(msg) = &job.status.message {
+                if let Some(msg) = &job.message {
                     if let Err(err) =
                         store.set_result_markdown(&run_id, &format!("Job failed: {msg}"))
                     {
@@ -345,12 +404,23 @@ async fn run_k8s(
 
     let mut last_status = status_of(&stored);
     let mut cancel_sent = false;
+    let mut consecutive_failures = 0u32;
 
     loop {
         let job = match k8s::inspect_job(context.as_deref(), &namespace, &job_name).await {
-            Ok(j) => j,
+            Ok(j) => {
+                consecutive_failures = 0;
+                j
+            }
             Err(err) => {
                 eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
+                if record_inspect_failure(&mut consecutive_failures) {
+                    give_up_on_unreachable_backend(
+                        &store, &run_id, "k8s", &err, &done_tx, log_task,
+                    )
+                    .await;
+                    return Ok(());
+                }
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
@@ -505,12 +575,23 @@ async fn run_modal(
 
     let mut last_status = status_of(&stored);
     let mut cancel_sent = false;
+    let mut consecutive_failures = 0u32;
 
     loop {
         let job = match modal::inspect_job(&sandbox_id).await {
-            Ok(j) => j,
+            Ok(j) => {
+                consecutive_failures = 0;
+                j
+            }
             Err(err) => {
                 eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
+                if record_inspect_failure(&mut consecutive_failures) {
+                    give_up_on_unreachable_backend(
+                        &store, &run_id, "modal", &err, &done_tx, log_task,
+                    )
+                    .await;
+                    return Ok(());
+                }
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
@@ -649,12 +730,23 @@ async fn watch_ssh_job(
 
     let mut last_status = initial_status;
     let mut cancel_sent = false;
+    let mut consecutive_failures = 0u32;
 
     loop {
         let job = match ssh::inspect_job(&target, &dir).await {
-            Ok(j) => j,
+            Ok(j) => {
+                consecutive_failures = 0;
+                j
+            }
             Err(err) => {
                 eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
+                if record_inspect_failure(&mut consecutive_failures) {
+                    // Shared by both `ssh_job` and `openresearch_job` — the
+                    // underlying transport is ssh either way.
+                    give_up_on_unreachable_backend(store, run_id, "ssh", &err, &done_tx, log_task)
+                        .await;
+                    return Ok(RunStatus::Failed);
+                }
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
@@ -1097,36 +1189,47 @@ async fn run_slurm(
 
     let mut last_status = status_of(&stored);
     let mut cancel_sent = false;
+    let mut consecutive_failures = 0u32;
     // "GONE" (scheduler doesn't know the job, no exit_code) must persist for
     // a full minute before it's believed: it also fires during slurmctld
     // restarts and while the exit_code write is NFS-lagged behind the compute
     // node. Any other observation resets the count.
-    const GONE_POLLS_TO_FAIL: u32 = (60 / POLL_INTERVAL.as_secs()) as u32;
-    let mut gone_polls = 0u32;
+    let mut gone = crate::jobs::GoneDebounce::new(Duration::from_secs(60), POLL_INTERVAL);
 
     loop {
         let mut job = match slurm::inspect_job(&host, &run_id, &job_id).await {
-            Ok(j) => j,
+            Ok(j) => {
+                consecutive_failures = 0;
+                j
+            }
             Err(err) => {
                 eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
+                if record_inspect_failure(&mut consecutive_failures) {
+                    give_up_on_unreachable_backend(
+                        &store, &run_id, "slurm", &err, &done_tx, log_task,
+                    )
+                    .await;
+                    return Ok(());
+                }
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
         };
-        if job.stage == "GONE" {
-            gone_polls += 1;
-            if gone_polls < GONE_POLLS_TO_FAIL {
+        match gone.observe(&job.stage) {
+            crate::jobs::GoneOutcome::StillWaiting => {
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
-            job = slurm::JobState {
-                stage: "ERROR".to_string(),
-                message: Some(
-                    "job left the queue without an exit code (killed or node lost?)".to_string(),
-                ),
-            };
-        } else {
-            gone_polls = 0;
+            crate::jobs::GoneOutcome::ConfirmedGone => {
+                job = slurm::JobState {
+                    stage: "ERROR".to_string(),
+                    message: Some(
+                        "job left the queue without an exit code (killed or node lost?)"
+                            .to_string(),
+                    ),
+                };
+            }
+            crate::jobs::GoneOutcome::NotGone => {}
         }
         let stage = job.stage.as_str();
         let status = run_status_for_stage(&store, &run_id, cancel_sent, stage);
@@ -1205,36 +1308,46 @@ async fn run_ray(
 
     let mut last_status = status_of(&stored);
     let mut cancel_sent = false;
+    let mut consecutive_failures = 0u32;
     // "GONE" (a 404 — the cluster no longer knows the job) must persist for a
     // full minute before it's believed: it also fires while a Ray head
     // restarts. Any other observation resets the count.
-    const GONE_POLLS_TO_FAIL: u32 = (60 / POLL_INTERVAL.as_secs()) as u32;
-    let mut gone_polls = 0u32;
+    let mut gone = crate::jobs::GoneDebounce::new(Duration::from_secs(60), POLL_INTERVAL);
 
     loop {
         let mut job = match ray::inspect_job(&address, &submission_id).await {
-            Ok(j) => j,
+            Ok(j) => {
+                consecutive_failures = 0;
+                j
+            }
             Err(err) => {
                 eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
+                if record_inspect_failure(&mut consecutive_failures) {
+                    give_up_on_unreachable_backend(
+                        &store, &run_id, "ray", &err, &done_tx, log_task,
+                    )
+                    .await;
+                    return Ok(());
+                }
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
         };
-        if job.stage == "GONE" {
-            gone_polls += 1;
-            if gone_polls < GONE_POLLS_TO_FAIL {
+        match gone.observe(&job.stage) {
+            crate::jobs::GoneOutcome::StillWaiting => {
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
-            job = ray::JobInfo {
-                stage: "ERROR".to_string(),
-                message: Some(
-                    "job no longer known to the cluster (record purged or head restarted?)"
-                        .to_string(),
-                ),
-            };
-        } else {
-            gone_polls = 0;
+            crate::jobs::GoneOutcome::ConfirmedGone => {
+                job = ray::JobInfo {
+                    stage: "ERROR".to_string(),
+                    message: Some(
+                        "job no longer known to the cluster (record purged or head restarted?)"
+                            .to_string(),
+                    ),
+                };
+            }
+            crate::jobs::GoneOutcome::NotGone => {}
         }
         let stage = job.stage.as_str();
         let status = run_status_for_stage(&store, &run_id, cancel_sent, stage);
