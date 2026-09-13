@@ -203,6 +203,7 @@ pub async fn submit_local_openresearch_with_source(
             .is_some_and(|run| run.cancel_requested),
         chat_session_id: args.launching_chat_session(),
         recovery_reason: None,
+        error_kind: None,
     };
 
     // From here the box is billing: never leak it behind an error the store
