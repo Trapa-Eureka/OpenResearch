@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{anyhow, Result};
 use crate::local::model::{LocalExperiment, LocalProject};
@@ -234,6 +234,66 @@ pub struct StoredRun {
     /// dashboard, an agent parsing `orx exp status --json`) should switch
     /// on; `recovery_reason` is the free-text half for a human to read.
     pub error_kind: Option<String>,
+    /// [`ProvenanceManifest::to_json`], captured once at launch (TASK 6,
+    /// Priority 4) and never rewritten — see [`ProvenanceManifest`] for what
+    /// it records and why. `None` for runs launched before this existed.
+    pub provenance_json: Option<String>,
+}
+
+/// Launch-time context for reproducing, auditing, or exporting a run — TASK
+/// 6 (Priority 4, "Strengthen Experiment Provenance Metadata"). Deliberately
+/// scoped to what's cheap and reliable to capture from the launching process
+/// itself, without new subprocess probes on the launch path (`orx exp run`
+/// is latency-sensitive) or restating data a run already carries on its own
+/// columns/`BackendDescriptor`:
+///
+/// - Git commit SHA — already `StoredRun::commit_sha`.
+/// - Exact execution command — already `StoredRun::command`.
+/// - Compute backend + its configuration (flavor, image, …) — already
+///   `StoredRun::backend_json` (`BackendDescriptor`).
+/// - Start/completion timestamps — already `created_at`/`ended_at`.
+///
+/// What's new here: which `orx` build launched the run, what launched it
+/// (a human via the CLI, or a named agent harness/model), the launching
+/// machine's OS/arch (a lightweight "environment fingerprint" — no secrets,
+/// no subprocess calls), and a snapshot of the experiment's parent id (so
+/// lineage survives even if the experiment itself is later reparented or
+/// deleted). Dependency/runtime versions, hardware details beyond OS/arch,
+/// and dataset/artifact references are NOT captured — the first two would
+/// need per-backend probing this task doesn't attempt, and the codebase has
+/// no dataset/artifact registry to reference.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvenanceManifest {
+    /// The `orx` build that launched this run (`CARGO_PKG_VERSION`).
+    pub orx_version: String,
+    /// OS of the machine `orx` ran on when it launched this run — NOT
+    /// necessarily where the payload executes (a remote backend's actual
+    /// hardware is requested via `BackendDescriptor.flavor`).
+    pub launcher_os: String,
+    pub launcher_arch: String,
+    /// The coding-agent harness that launched this run (e.g. `"claude"`,
+    /// `"codex"`, `"opencode"`), when launched from an agent chat session
+    /// rather than a plain CLI invocation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_harness: Option<String>,
+    /// The model that harness was using at launch time, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
+    /// The launching experiment's `parent_experiment_id` at launch time —
+    /// a snapshot, since the live experiment row could later change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_experiment_id: Option<String>,
+}
+
+impl ProvenanceManifest {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    pub fn parse(json: &str) -> Option<Self> {
+        serde_json::from_str(json).ok()
+    }
 }
 
 /// Lifecycle of a [`StoredRun`]. `Starting` and `Running` are the only
@@ -647,6 +707,7 @@ impl Store {
             "ALTER TABLE runs ADD COLUMN chat_session_id TEXT",
             "ALTER TABLE runs ADD COLUMN recovery_reason TEXT",
             "ALTER TABLE runs ADD COLUMN error_kind TEXT",
+            "ALTER TABLE runs ADD COLUMN provenance_json TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN permission_mode TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN service_tier TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN plan_mode INTEGER NOT NULL DEFAULT 0",
@@ -991,8 +1052,9 @@ impl Store {
             "INSERT INTO runs (id, experiment_id, project_id, status, backend_json, command,
                                created_at, updated_at, ended_at, exit_code,
                                commit_sha, result_markdown, cancel_requested,
-                               chat_session_id, recovery_reason, error_kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                               chat_session_id, recovery_reason, error_kind,
+                               provenance_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(id) DO UPDATE SET
                status = excluded.status,
                backend_json = excluded.backend_json,
@@ -1001,13 +1063,14 @@ impl Store {
                exit_code = excluded.exit_code,
                commit_sha = excluded.commit_sha,
                result_markdown = excluded.result_markdown",
-            // chat_session_id, recovery_reason, and error_kind are
-            // deliberately absent from the DO UPDATE SET: run ownership is
-            // immutable, so a later status upsert never rewrites (or
-            // clears) the session that launched the run, and a backend
-            // re-recording its descriptor never clobbers the
-            // reason/classification `mark_run_unrecoverable` already
-            // stamped.
+            // chat_session_id, recovery_reason, error_kind, and
+            // provenance_json are deliberately absent from the DO UPDATE
+            // SET: run ownership and launch-time provenance are immutable,
+            // so a later status upsert never rewrites (or clears) the
+            // session that launched the run or the manifest it launched
+            // with, and a backend re-recording its descriptor never
+            // clobbers the reason/classification `mark_run_unrecoverable`
+            // already stamped.
             params![
                 run.id,
                 run.experiment_id,
@@ -1025,6 +1088,7 @@ impl Store {
                 run.chat_session_id,
                 run.recovery_reason,
                 run.error_kind,
+                run.provenance_json,
             ],
         )?;
         Ok(())
@@ -1220,11 +1284,15 @@ impl Store {
     }
 
     pub fn list_ready_run_wakeups(&self) -> Result<Vec<RunWakeup>> {
+        // `r.*` (not a hand-rolled column list) so this can never again drift
+        // out of sync with `row_to_run`'s expected shape the way it silently
+        // did across TASK 2/5 (recovery_reason/error_kind were reading the
+        // wakeup's own `chat_session_id`/`state` columns instead — wrong
+        // data, not even an error, until TASK 6 finally added a column past
+        // the end and turned it into one). The wakeup's own two columns are
+        // named to avoid the `chat_session_id` collision with `r.*`.
         let mut stmt = self.conn.prepare(
-            "SELECT r.id, r.experiment_id, r.project_id, r.status, r.backend_json, r.command,
-                    r.created_at, r.updated_at, r.ended_at, r.exit_code,
-                    r.commit_sha, r.result_markdown, r.cancel_requested, r.chat_session_id,
-                    w.chat_session_id, w.state
+            "SELECT r.*, w.chat_session_id AS wakeup_chat_session_id, w.state AS wakeup_state
              FROM chat_run_wakeups w
              JOIN runs r ON r.id = w.run_id
              WHERE w.state IN ('pending', 'claimed') AND r.status IN ('done', 'failed')
@@ -1233,8 +1301,8 @@ impl Store {
         let rows = stmt.query_map([], |row| {
             Ok(RunWakeup {
                 run: row_to_run(row)?,
-                chat_session_id: row.get(14)?,
-                state: row.get(15)?,
+                chat_session_id: row.get("wakeup_chat_session_id")?,
+                state: row.get("wakeup_state")?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -3163,7 +3231,8 @@ fn row_to_chat_session(
 const SELECT_RUN: &str = "SELECT id, experiment_id, project_id, status, backend_json, command,
                                  created_at, updated_at, ended_at, exit_code,
                                  commit_sha, result_markdown, cancel_requested,
-                                 chat_session_id, recovery_reason, error_kind FROM runs";
+                                 chat_session_id, recovery_reason, error_kind,
+                                 provenance_json FROM runs";
 
 const PROJECT_COLS: &str = "id, name, slug, github_owner, github_repo, github_sync_enabled, \
                             baseline_branch, repo_path, run_command, paper_id, created_at, updated_at";
@@ -3190,6 +3259,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> std::result::Result<StoredRun, rusqlit
         chat_session_id: row.get(13)?,
         recovery_reason: row.get(14)?,
         error_kind: row.get(15)?,
+        provenance_json: row.get(16)?,
     })
 }
 
@@ -4461,6 +4531,7 @@ mod tests {
             chat_session_id: chat_session_id.map(str::to_string),
             recovery_reason: None,
             error_kind: None,
+            provenance_json: None,
         }
     }
 
@@ -4514,6 +4585,88 @@ mod tests {
         }
         assert_eq!(RunStatus::parse("not-a-real-status"), None);
         assert!(!is_terminal_status("not-a-real-status"));
+    }
+
+    /// TASK 6 (experiment provenance): the manifest round-trips through JSON
+    /// exactly, including when optional fields are absent.
+    #[test]
+    fn provenance_manifest_round_trips_through_json() {
+        let full = ProvenanceManifest {
+            orx_version: "0.2.1".into(),
+            launcher_os: "macos".into(),
+            launcher_arch: "aarch64".into(),
+            agent_harness: Some("claude".into()),
+            agent_model: Some("claude-sonnet-5".into()),
+            parent_experiment_id: Some("exp_parent".into()),
+        };
+        let parsed = ProvenanceManifest::parse(&full.to_json()).unwrap();
+        assert_eq!(parsed, full);
+        assert!(
+            !full.to_json().contains("null"),
+            "Option fields must be omitted, not serialized as null: {}",
+            full.to_json()
+        );
+
+        let minimal = ProvenanceManifest {
+            orx_version: "0.2.1".into(),
+            launcher_os: "linux".into(),
+            launcher_arch: "x86_64".into(),
+            agent_harness: None,
+            agent_model: None,
+            parent_experiment_id: None,
+        };
+        assert_eq!(
+            ProvenanceManifest::parse(&minimal.to_json()).unwrap(),
+            minimal
+        );
+
+        assert_eq!(ProvenanceManifest::parse("not json"), None);
+    }
+
+    /// Provenance is captured once at launch and must never be clobbered by
+    /// a later `upsert_run` — every backend re-upserts the same run id once
+    /// its real handle is known, and that second write must leave the
+    /// original manifest alone (the same immutability `chat_session_id`
+    /// already relies on).
+    #[test]
+    fn provenance_json_survives_a_later_upsert_run() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-store-provenance-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let manifest = ProvenanceManifest {
+            orx_version: "0.2.1".into(),
+            launcher_os: std::env::consts::OS.into(),
+            launcher_arch: std::env::consts::ARCH.into(),
+            agent_harness: Some("claude".into()),
+            agent_model: Some("claude-sonnet-5".into()),
+            parent_experiment_id: None,
+        };
+        let mut run = run_fixture("run_1", "starting", None);
+        run.provenance_json = Some(manifest.to_json());
+        store.upsert_run(&run).unwrap();
+
+        // A backend's own later upsert — e.g. once the real job id is known
+        // — naturally constructs its `StoredRun` with `provenance_json: None`
+        // (it never re-derives the manifest); that must not erase what the
+        // first upsert already stored.
+        let mut backend_update = run_fixture("run_1", "running", None);
+        backend_update.backend_json = r#"{"kind":"local_job","jobId":"real-handle"}"#.into();
+        backend_update.provenance_json = None;
+        store.upsert_run(&backend_update).unwrap();
+
+        let stored = store.get_run("run_1").unwrap().unwrap();
+        assert_eq!(stored.status, "running");
+        assert_eq!(
+            stored.backend_json,
+            r#"{"kind":"local_job","jobId":"real-handle"}"#
+        );
+        assert_eq!(
+            ProvenanceManifest::parse(&stored.provenance_json.unwrap()).unwrap(),
+            manifest,
+            "provenance must survive the backend's follow-up upsert"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Test scenario from the state-machine design doc: "duplicate completion

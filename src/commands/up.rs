@@ -872,6 +872,13 @@ struct ApiRun {
     /// newer `orx` version never surfaces as a silently-wrong classification.
     #[serde(skip_serializing_if = "Option::is_none")]
     error_kind: Option<String>,
+    /// Launch-time provenance (TASK 6: orx version, launcher OS/arch,
+    /// launching agent, parent experiment) for reproducing, auditing, or
+    /// exporting this run — see [`crate::store::ProvenanceManifest`]. `None`
+    /// for runs launched before this existed, or if the stored JSON somehow
+    /// fails to parse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<crate::store::ProvenanceManifest>,
 }
 
 impl From<&StoredRun> for ApiRun {
@@ -896,6 +903,10 @@ impl From<&StoredRun> for ApiRun {
                 .as_deref()
                 .and_then(crate::error::ErrorKind::parse)
                 .map(|k| k.as_str().to_string()),
+            provenance: run
+                .provenance_json
+                .as_deref()
+                .and_then(crate::store::ProvenanceManifest::parse),
         }
     }
 }
@@ -8116,6 +8127,7 @@ mod tests {
             chat_session_id: None,
             recovery_reason: None,
             error_kind: None,
+            provenance_json: None,
         };
 
         let value = serde_json::to_value(ApiRun::from(&run)).unwrap();
