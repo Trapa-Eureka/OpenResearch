@@ -34,11 +34,42 @@ fn open_supervisor_lock(path: &std::path::Path) -> Result<fd_lock::RwLock<std::f
     Ok(fd_lock::RwLock::new(file))
 }
 
+fn supervisor_lock_path(run_id: &str) -> std::path::PathBuf {
+    log_path(run_id).with_extension("supervisor.lock")
+}
+
+/// Whether a supervisor is currently alive and watching `run_id`, checked by
+/// probing the same `fd_lock` file `run()` holds for as long as it supervises
+/// — the lock is an OS-level advisory lock, so it is released automatically
+/// (by the kernel) the instant the holding process dies or the machine
+/// reboots, with no heartbeat/TTL of our own to go stale. Used by
+/// reconciliation (`commands::exp::reconcile_active_runs`) to tell an
+/// orphaned run (no supervisor left to notice it finished, or died) from one
+/// that is already being watched.
+pub(crate) fn run_has_live_supervisor(run_id: &str) -> Result<bool> {
+    probe_supervisor_lock(&supervisor_lock_path(run_id))
+}
+
+/// The path-parameterized core of [`run_has_live_supervisor`], split out so
+/// tests can probe an arbitrary temp path instead of the real, `data_dir()`-
+/// resolved one.
+fn probe_supervisor_lock(path: &std::path::Path) -> Result<bool> {
+    let mut lock = open_supervisor_lock(path)?;
+    let live = match lock.try_write() {
+        // Acquired it ourselves: nobody else is holding it. Drop immediately
+        // — this is a liveness probe, not a claim.
+        Ok(_guard) => Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+        Err(err) => Err(err.into()),
+    };
+    live
+}
+
 pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
     let run_id = args.run_id;
 
     let store = Store::open()?;
-    let lock_path = log_path(&run_id).with_extension("supervisor.lock");
+    let lock_path = supervisor_lock_path(&run_id);
     let mut supervisor_lock = open_supervisor_lock(&lock_path)?;
     let _supervisor_guard = match supervisor_lock.try_write() {
         Ok(guard) => guard,
@@ -1357,6 +1388,7 @@ mod tests {
             result_markdown: None,
             cancel_requested: false,
             chat_session_id: None,
+            recovery_reason: None,
         };
         store.upsert_run(&run).unwrap();
 
@@ -1396,6 +1428,61 @@ mod tests {
         drop(first_guard);
         drop(first);
         drop(second);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// TASK 2 (crash recovery/reconciliation): a run with nobody holding its
+    /// supervisor lock — never spawned, or the supervisor already exited
+    /// after finishing — reads as having no live supervisor.
+    #[test]
+    fn probe_reports_no_live_supervisor_when_the_lock_is_free() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-probe-free-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("run.lock");
+
+        assert!(!probe_supervisor_lock(&path).unwrap());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A live supervisor (or, in this test, anything holding the lock) makes
+    /// the probe report `true` without disturbing the holder's guard.
+    #[test]
+    fn probe_reports_a_live_supervisor_while_the_lock_is_held() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-probe-held-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("run.lock");
+        let mut holder = open_supervisor_lock(&path).unwrap();
+        let guard = holder.try_write().unwrap();
+
+        assert!(probe_supervisor_lock(&path).unwrap());
+
+        drop(guard);
+        drop(holder);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Once the holder releases the lock (the supervisor process exits — here
+    /// simulated by dropping the guard and the lock itself), a fresh probe
+    /// immediately sees it as free again: this is the OS-level, no-TTL
+    /// liveness signal reconciliation relies on.
+    #[test]
+    fn probe_flips_back_to_no_supervisor_once_the_holder_releases_it() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-probe-release-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("run.lock");
+        let mut holder = open_supervisor_lock(&path).unwrap();
+        let guard = holder.try_write().unwrap();
+        assert!(probe_supervisor_lock(&path).unwrap());
+
+        drop(guard);
+        drop(holder);
+
+        assert!(!probe_supervisor_lock(&path).unwrap());
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }
