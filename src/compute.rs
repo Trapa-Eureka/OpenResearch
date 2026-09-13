@@ -758,6 +758,7 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         result_markdown: None,
         cancel_requested: false,
         chat_session_id: args.launching_chat_session(),
+        recovery_reason: None,
     };
     reserve_run(&store, &pending, args.force)?;
     let pending_backend_json = descriptor.to_json();
