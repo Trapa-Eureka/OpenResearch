@@ -481,6 +481,7 @@ mod tests {
                 chat_session_id: None,
                 recovery_reason: None,
                 error_kind: None,
+                provenance_json: None,
             };
             store.upsert_run(&run).unwrap();
             let terminal = crate::jobs::stage_to_run_status(&state.stage);
