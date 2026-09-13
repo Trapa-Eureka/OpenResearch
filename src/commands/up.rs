@@ -860,6 +860,18 @@ struct ApiRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_code: Option<i64>,
     cancel_requested: bool,
+    /// Free-text explanation when `orx` itself force-failed this run (crash
+    /// recovery giving up, a backend going unreachable) rather than the
+    /// backend reporting its own outcome. See `error_kind` for the stable,
+    /// machine-readable counterpart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_reason: Option<String>,
+    /// Stable [`crate::error::ErrorKind`] code for the same failure — the
+    /// half an agent or the dashboard should switch on. `None` unless the
+    /// stored value round-trips through a known code, so a value from a
+    /// newer `orx` version never surfaces as a silently-wrong classification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_kind: Option<String>,
 }
 
 impl From<&StoredRun> for ApiRun {
@@ -878,6 +890,12 @@ impl From<&StoredRun> for ApiRun {
             ended_at: run.ended_at,
             exit_code: run.exit_code,
             cancel_requested: run.cancel_requested,
+            recovery_reason: run.recovery_reason.clone(),
+            error_kind: run
+                .error_kind
+                .as_deref()
+                .and_then(crate::error::ErrorKind::parse)
+                .map(|k| k.as_str().to_string()),
         }
     }
 }
@@ -8097,6 +8115,7 @@ mod tests {
             cancel_requested: true,
             chat_session_id: None,
             recovery_reason: None,
+            error_kind: None,
         };
 
         let value = serde_json::to_value(ApiRun::from(&run)).unwrap();

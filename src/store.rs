@@ -223,9 +223,17 @@ pub struct StoredRun {
     /// Set only by [`Store::mark_run_unrecoverable`] when reconciliation gives
     /// up on the run (e.g. no supervisor could be (re)started after repeated
     /// attempts) rather than a backend reporting a normal failure. `None` for
-    /// every other outcome, including a plain `Failed` run. A short, stable,
-    /// machine-readable string — see `commands::exp::reconcile_active_runs`.
+    /// every other outcome, including a plain `Failed` run. Free-text and
+    /// human-facing (also appended to `result_markdown`) — see
+    /// `error_kind` below for the stable, machine-readable counterpart.
     pub recovery_reason: Option<String>,
+    /// The stable [`crate::error::ErrorKind`] code (as
+    /// [`crate::error::ErrorKind::as_str`]) for a run [`Store::mark_run_unrecoverable`]
+    /// force-failed — set together with `recovery_reason`, `None` in every
+    /// other case. This is the machine-readable half a consumer (the
+    /// dashboard, an agent parsing `orx exp status --json`) should switch
+    /// on; `recovery_reason` is the free-text half for a human to read.
+    pub error_kind: Option<String>,
 }
 
 /// Lifecycle of a [`StoredRun`]. `Starting` and `Running` are the only
@@ -638,6 +646,7 @@ impl Store {
             "ALTER TABLE runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE runs ADD COLUMN chat_session_id TEXT",
             "ALTER TABLE runs ADD COLUMN recovery_reason TEXT",
+            "ALTER TABLE runs ADD COLUMN error_kind TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN permission_mode TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN service_tier TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN plan_mode INTEGER NOT NULL DEFAULT 0",
@@ -982,8 +991,8 @@ impl Store {
             "INSERT INTO runs (id, experiment_id, project_id, status, backend_json, command,
                                created_at, updated_at, ended_at, exit_code,
                                commit_sha, result_markdown, cancel_requested,
-                               chat_session_id, recovery_reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                               chat_session_id, recovery_reason, error_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(id) DO UPDATE SET
                status = excluded.status,
                backend_json = excluded.backend_json,
@@ -992,11 +1001,13 @@ impl Store {
                exit_code = excluded.exit_code,
                commit_sha = excluded.commit_sha,
                result_markdown = excluded.result_markdown",
-            // chat_session_id and recovery_reason are deliberately absent from
-            // the DO UPDATE SET: run ownership is immutable, so a later status
-            // upsert never rewrites (or clears) the session that launched the
-            // run, and a backend re-recording its descriptor never clobbers a
-            // recovery reason `mark_run_unrecoverable` already stamped.
+            // chat_session_id, recovery_reason, and error_kind are
+            // deliberately absent from the DO UPDATE SET: run ownership is
+            // immutable, so a later status upsert never rewrites (or
+            // clears) the session that launched the run, and a backend
+            // re-recording its descriptor never clobbers the
+            // reason/classification `mark_run_unrecoverable` already
+            // stamped.
             params![
                 run.id,
                 run.experiment_id,
@@ -1013,6 +1024,7 @@ impl Store {
                 run.cancel_requested,
                 run.chat_session_id,
                 run.recovery_reason,
+                run.error_kind,
             ],
         )?;
         Ok(())
@@ -1560,19 +1572,26 @@ impl Store {
 
     /// Force a run to `Failed` because reconciliation, not the backend, gave
     /// up on it (e.g. no supervisor could be started after repeated
-    /// attempts), recording `reason` on `recovery_reason` and appending it to
-    /// `result_markdown` for human visibility. Goes through
-    /// [`Store::update_status`], so it inherits the same terminal-state
-    /// guard: if the run reached a real terminal state first (it finished, or
-    /// was cancelled, before reconciliation caught up with it), this is a
-    /// no-op and `reason` is never recorded — reconciliation must never
-    /// overwrite a legitimate outcome.
-    pub fn mark_run_unrecoverable(&self, run_id: &str, reason: &str) -> Result<bool> {
+    /// attempts), recording `reason` (free-text, human-facing) on
+    /// `recovery_reason` and `kind` (stable, machine-readable — Priority 9)
+    /// on `error_kind`, and appending `reason` to `result_markdown` for
+    /// human visibility. Goes through [`Store::update_status`], so it
+    /// inherits the same terminal-state guard: if the run reached a real
+    /// terminal state first (it finished, or was cancelled, before
+    /// reconciliation caught up with it), this is a no-op and neither field
+    /// is ever recorded — reconciliation must never overwrite a legitimate
+    /// outcome.
+    pub fn mark_run_unrecoverable(
+        &self,
+        run_id: &str,
+        kind: crate::error::ErrorKind,
+        reason: &str,
+    ) -> Result<bool> {
         let applied = self.update_status(run_id, RunStatus::Failed, Some(now_ms()), None)?;
         if applied {
             self.conn.execute(
-                "UPDATE runs SET recovery_reason = ?2 WHERE id = ?1",
-                params![run_id, reason],
+                "UPDATE runs SET recovery_reason = ?2, error_kind = ?3 WHERE id = ?1",
+                params![run_id, reason, kind.as_str()],
             )?;
             let existing = self
                 .get_run(run_id)?
@@ -3144,7 +3163,7 @@ fn row_to_chat_session(
 const SELECT_RUN: &str = "SELECT id, experiment_id, project_id, status, backend_json, command,
                                  created_at, updated_at, ended_at, exit_code,
                                  commit_sha, result_markdown, cancel_requested,
-                                 chat_session_id, recovery_reason FROM runs";
+                                 chat_session_id, recovery_reason, error_kind FROM runs";
 
 const PROJECT_COLS: &str = "id, name, slug, github_owner, github_repo, github_sync_enabled, \
                             baseline_branch, repo_path, run_command, paper_id, created_at, updated_at";
@@ -3170,6 +3189,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> std::result::Result<StoredRun, rusqlit
         cancel_requested: row.get(12)?,
         chat_session_id: row.get(13)?,
         recovery_reason: row.get(14)?,
+        error_kind: row.get(15)?,
     })
 }
 
@@ -4440,6 +4460,7 @@ mod tests {
             cancel_requested: false,
             chat_session_id: chat_session_id.map(str::to_string),
             recovery_reason: None,
+            error_kind: None,
         }
     }
 
@@ -4704,7 +4725,11 @@ mod tests {
             .unwrap();
 
         assert!(store
-            .mark_run_unrecoverable("run_1", "no supervisor could be started")
+            .mark_run_unrecoverable(
+                "run_1",
+                crate::error::ErrorKind::Reconciliation,
+                "no supervisor could be started"
+            )
             .unwrap());
 
         let run = store.get_run("run_1").unwrap().unwrap();
@@ -4713,6 +4738,7 @@ mod tests {
             run.recovery_reason.as_deref(),
             Some("no supervisor could be started")
         );
+        assert_eq!(run.error_kind.as_deref(), Some("reconciliation_failure"));
         assert!(run
             .result_markdown
             .unwrap()
@@ -4741,7 +4767,11 @@ mod tests {
             .unwrap());
 
         assert!(!store
-            .mark_run_unrecoverable("run_1", "reconciliation gave up")
+            .mark_run_unrecoverable(
+                "run_1",
+                crate::error::ErrorKind::Reconciliation,
+                "reconciliation gave up"
+            )
             .unwrap());
 
         let run = store.get_run("run_1").unwrap().unwrap();
@@ -4750,6 +4780,7 @@ mod tests {
             "a real completion must not be clobbered"
         );
         assert_eq!(run.recovery_reason, None);
+        assert_eq!(run.error_kind, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4769,21 +4800,23 @@ mod tests {
             .unwrap();
 
         assert!(store
-            .mark_run_unrecoverable("run_1", "first reason")
+            .mark_run_unrecoverable(
+                "run_1",
+                crate::error::ErrorKind::Reconciliation,
+                "first reason"
+            )
             .unwrap());
         assert!(!store
-            .mark_run_unrecoverable("run_1", "second reason")
+            .mark_run_unrecoverable(
+                "run_1",
+                crate::error::ErrorKind::BackendUnavailable,
+                "second reason"
+            )
             .unwrap());
 
-        assert_eq!(
-            store
-                .get_run("run_1")
-                .unwrap()
-                .unwrap()
-                .recovery_reason
-                .as_deref(),
-            Some("first reason")
-        );
+        let run = store.get_run("run_1").unwrap().unwrap();
+        assert_eq!(run.recovery_reason.as_deref(), Some("first reason"));
+        assert_eq!(run.error_kind.as_deref(), Some("reconciliation_failure"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
