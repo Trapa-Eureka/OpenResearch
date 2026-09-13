@@ -5,6 +5,12 @@ pub struct ServeArgs {
     /// Port to bind on 127.0.0.1 (default 4790 — what the api proxies to).
     #[arg(long)]
     pub port: Option<u16>,
+    /// Require `Authorization: Bearer <token>` on every request. Falls back
+    /// to the `ORX_SERVE_TOKEN` env var when omitted. Unset by default for
+    /// backward compatibility, but strongly recommended whenever this runs
+    /// on a host other local users can reach — see SECURITY.md.
+    #[arg(long)]
+    pub token: Option<String>,
 }
 
 #[derive(Args, Debug)]

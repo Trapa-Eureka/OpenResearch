@@ -31,6 +31,7 @@ mod plane;
 mod remote;
 mod store;
 mod telemetry;
+mod token_auth;
 mod updates;
 mod workspace_state;
 
