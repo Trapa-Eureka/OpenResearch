@@ -163,6 +163,7 @@ pub async fn submit_local_ray_with_source(
             .is_some_and(|run| run.cancel_requested),
         chat_session_id: args.launching_chat_session(),
         recovery_reason: None,
+        error_kind: None,
     };
     store.upsert_run(&run)?;
 
