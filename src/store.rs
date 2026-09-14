@@ -222,27 +222,8 @@ pub struct StoredRun {
     pub chat_session_id: Option<String>,
 }
 
-/// Lifecycle of a [`StoredRun`]. `Starting` and `Running` are the only
-/// non-terminal states — every backend (local process, ssh, k8s, Slurm, Ray,
-/// Modal, HF Jobs, an OpenResearch box) settles into exactly one of `Done`,
-/// `Failed` or `Cancelled` and stays there:
-///
-/// ```text
-/// Starting
-///   ↓
-/// Running
-///   ├── Done
-///   ├── Failed
-///   └── Cancelled
-/// ```
-///
-/// A run may also jump straight from `Starting` to a terminal state (a
-/// submission that fails, or is cancelled, before the backend ever reports
-/// `Running`). What is never legal is moving *out* of a terminal state, or
-/// moving backward from `Running` to `Starting` — [`Store::update_status`] is
-/// the single place both rules are enforced, atomically, at the SQL layer, so
-/// a duplicate completion callback, or a completion racing a cancellation,
-/// can only ever be a no-op rather than corrupt the row.
+/// Run lifecycle: active states can finish once; terminal outcomes never change.
+/// Both status updates and submission upserts enforce these transitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
     /// Submitted to the backend; not yet observed running.
@@ -258,10 +239,8 @@ pub enum RunStatus {
 }
 
 impl RunStatus {
-    /// Every state, for enumerating legal transitions generically (see
-    /// [`Store::update_status`]) instead of hand-duplicating
-    /// [`RunStatus::can_transition_to`]'s table at each call site.
-    pub const ALL: [RunStatus; 5] = [
+    #[cfg(test)]
+    const ALL: [RunStatus; 5] = [
         Self::Starting,
         Self::Running,
         Self::Done,
@@ -298,15 +277,10 @@ impl RunStatus {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
     }
 
-    /// Whether `self -> to` is a legal direct transition. Terminal states are
-    /// absorbing (nothing transitions out of them, including into the same
-    /// state — so a duplicate terminal write is rejected rather than treated
-    /// as a legal self-transition), and `Running` never regresses to
-    /// `Starting`.
-    pub fn can_transition_to(self, to: RunStatus) -> bool {
+    fn can_transition_to(self, to: RunStatus) -> bool {
         use RunStatus::*;
         match self {
-            Starting => matches!(to, Starting | Running | Done | Failed | Cancelled),
+            Starting => true,
             Running => matches!(to, Running | Done | Failed | Cancelled),
             Done | Failed | Cancelled => false,
         }
@@ -961,20 +935,18 @@ impl Store {
     }
 
     pub fn upsert_run(&self, run: &StoredRun) -> Result<()> {
-        self.conn.execute(
+        let status = RunStatus::parse(&run.status)
+            .ok_or_else(|| anyhow!("Unknown run status: {}", run.status))?;
+        let tx = self.begin()?;
+        tx.execute(
             "INSERT INTO runs (id, experiment_id, project_id, status, backend_json, command,
                                created_at, updated_at, ended_at, exit_code,
                                commit_sha, result_markdown, cancel_requested,
                                chat_session_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id) DO UPDATE SET
-               status = excluded.status,
                backend_json = excluded.backend_json,
-               updated_at = excluded.updated_at,
-               ended_at = excluded.ended_at,
-               exit_code = excluded.exit_code,
-               commit_sha = excluded.commit_sha,
-               result_markdown = excluded.result_markdown",
+               commit_sha = excluded.commit_sha",
             // chat_session_id is deliberately absent from the DO UPDATE SET:
             // run ownership is immutable, so a later status upsert never
             // rewrites (or clears) the session that launched the run.
@@ -995,22 +967,18 @@ impl Store {
                 run.chat_session_id,
             ],
         )?;
+        // Late submission handles must survive even when their status update is stale.
+        if self.update_status(&run.id, status, run.ended_at, run.exit_code)? {
+            tx.execute(
+                "UPDATE runs SET result_markdown = ?2, updated_at = ?3 WHERE id = ?1",
+                params![run.id, run.result_markdown, run.updated_at],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
-    /// Move a run to `status`, honoring [`RunStatus::can_transition_to`].
-    /// Returns `Ok(true)` if the row was actually updated, `Ok(false)` if the
-    /// transition was illegal — most commonly because the run had already
-    /// reached a terminal state. `Ok(false)` is an expected, benign outcome
-    /// (a duplicate completion callback, a completion arriving after the run
-    /// was already marked cancelled, a stale poll racing a fresher one) and
-    /// callers are not required to treat it as an error; the row simply keeps
-    /// whatever terminal status it already settled on.
-    ///
-    /// The check-and-write happens in one statement, so this is safe to call
-    /// from multiple processes/threads racing on the same run: whichever
-    /// write lands first wins, and every later one is a no-op rather than a
-    /// corruption.
+    /// Atomically apply a legal transition; false leaves the outcome untouched.
     pub fn update_status(
         &self,
         run_id: &str,
@@ -1018,32 +986,19 @@ impl Store {
         ended_at: Option<i64>,
         exit_code: Option<i64>,
     ) -> Result<bool> {
-        // Derive the legal-source set straight from `can_transition_to`
-        // rather than hand-duplicating its table here, so the two can never
-        // drift apart. A row not yet in the table (a fresh `Starting` write
-        // racing `upsert_run`) also matches nothing and is correctly a no-op:
-        // the run is created via `upsert_run`, not `update_status`.
-        let sources: Vec<&'static str> = RunStatus::ALL
-            .into_iter()
-            .filter(|from| from.can_transition_to(status))
-            .map(RunStatus::as_str)
-            .collect();
-        if sources.is_empty() {
-            return Ok(false);
-        }
-        let source_list = sources
-            .iter()
-            .map(|s| format!("'{s}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
+        let applied = self.conn.execute(
             "UPDATE runs SET status = ?2, updated_at = ?3, ended_at = COALESCE(?4, ended_at),
                              exit_code = COALESCE(?5, exit_code)
-             WHERE id = ?1 AND status IN ({source_list})"
-        );
-        let applied = self.conn.execute(
-            &sql,
-            params![run_id, status.as_str(), now_ms(), ended_at, exit_code],
+             WHERE id = ?1 AND ((status = 'starting' AND ?6) OR (status = 'running' AND ?7))",
+            params![
+                run_id,
+                status.as_str(),
+                now_ms(),
+                ended_at,
+                exit_code,
+                RunStatus::Starting.can_transition_to(status),
+                RunStatus::Running.can_transition_to(status),
+            ],
         )?;
         Ok(applied == 1)
     }
@@ -4414,6 +4369,71 @@ mod tests {
     }
 
     #[test]
+    fn status_writers_enforce_every_transition_and_preserve_terminal_outcomes() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-store-transitions-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        for from in RunStatus::ALL {
+            for to in RunStatus::ALL {
+                for upsert in [false, true] {
+                    let id = format!("{from}-{to}-{upsert}");
+                    let mut original = run_fixture(&id, from.as_str(), Some("owner"));
+                    original.result_markdown = Some("original result".into());
+                    original.ended_at = from.is_terminal().then_some(10);
+                    original.exit_code = from.is_terminal().then_some(0);
+                    original.cancel_requested = true;
+                    store.upsert_run(&original).unwrap();
+                    let before = store.get_run(&id).unwrap().unwrap();
+                    let expected = from == RunStatus::Starting
+                        || (from == RunStatus::Running && to != RunStatus::Starting);
+                    if upsert {
+                        let mut incoming = run_fixture(&id, to.as_str(), None);
+                        incoming.backend_json = "{\"job_id\":\"late-handle\"}".into();
+                        incoming.ended_at = Some(20);
+                        incoming.exit_code = Some(1);
+                        incoming.result_markdown = Some("new result".into());
+                        store.upsert_run(&incoming).unwrap();
+                    } else {
+                        assert_eq!(
+                            store.update_status(&id, to, Some(20), Some(1)).unwrap(),
+                            expected,
+                        );
+                    }
+                    let after = store.get_run(&id).unwrap().unwrap();
+                    assert_eq!(
+                        after.status,
+                        if expected { to } else { from }.as_str(),
+                        "{id}"
+                    );
+                    assert_eq!(after.chat_session_id, before.chat_session_id);
+                    assert!(after.cancel_requested);
+                    if expected {
+                        assert_eq!(after.ended_at, Some(20));
+                        assert_eq!(after.exit_code, Some(1));
+                    } else {
+                        assert_eq!(after.ended_at, before.ended_at);
+                        assert_eq!(after.exit_code, before.exit_code);
+                        assert_eq!(after.updated_at, before.updated_at);
+                        assert_eq!(after.result_markdown, before.result_markdown);
+                    }
+                    if upsert {
+                        assert!(after.backend_json.contains("late-handle"));
+                        if expected {
+                            assert_eq!(after.result_markdown.as_deref(), Some("new result"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(store
+            .upsert_run(&run_fixture("invalid", "unknown", None))
+            .is_err());
+        assert!(store.get_run("invalid").unwrap().is_none());
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn run_status_is_terminal_matches_the_three_absorbing_states() {
         for status in RunStatus::ALL {
             assert_eq!(
@@ -4617,17 +4637,18 @@ mod tests {
             1,
             "exactly one racing writer should win: {applied:?}"
         );
-        let final_status = store_reopen(&dir).get_run("run_1").unwrap().unwrap().status;
+        let final_status = Store::open_at(dir.clone())
+            .unwrap()
+            .get_run("run_1")
+            .unwrap()
+            .unwrap()
+            .status;
         assert!(
             RunStatus::parse(&final_status).is_some_and(RunStatus::is_terminal),
             "run must settle on a real terminal state, got {final_status:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn store_reopen(dir: &std::path::Path) -> Store {
-        Store::open_at(dir.to_path_buf()).unwrap()
     }
 
     #[test]
@@ -4901,7 +4922,10 @@ mod tests {
             .unwrap();
 
         let run = store.get_run("run_1").unwrap().unwrap();
-        assert_eq!(run.status, "done", "status still updates on conflict");
+        assert_eq!(
+            run.status, "failed",
+            "terminal outcome survives later upserts"
+        );
         assert_eq!(
             run.chat_session_id,
             Some("chat_A".to_string()),

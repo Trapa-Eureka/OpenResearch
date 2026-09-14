@@ -48,7 +48,7 @@ pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
     let stored = store
         .get_run(&run_id)?
         .ok_or_else(|| anyhow!("Run {} not found in the local store.", run_id))?;
-    if crate::local::is_terminal(&stored.status) {
+    if status_of(&stored)?.is_terminal() {
         return Ok(());
     }
     if store.get_local_experiment(&stored.experiment_id)?.is_none() {
@@ -64,15 +64,16 @@ pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
         }
     }
     if descriptor.job_id.is_none() {
-        store.update_status(&run_id, RunStatus::Failed, Some(now_ms()), None)?;
-        store.set_result_markdown(
-            &run_id,
-            &format!(
-                "Submission was interrupted before the {} provider handle was recorded. \
-                 Inspect the provider for resources labelled or_run={run_id} before retrying.",
-                descriptor.kind.trim_end_matches("_job")
-            ),
-        )?;
+        if store.update_status(&run_id, RunStatus::Failed, Some(now_ms()), None)? {
+            store.set_result_markdown(
+                &run_id,
+                &format!(
+                    "Submission was interrupted before the {} provider handle was recorded. \
+                     Inspect the provider for resources labelled or_run={run_id} before retrying.",
+                    descriptor.kind.trim_end_matches("_job")
+                ),
+            )?;
+        }
         return Ok(());
     }
     if descriptor.kind == "k8s_job" {
@@ -120,7 +121,7 @@ pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
         done_rx,
     ));
 
-    let mut last_status = status_of(&stored);
+    let mut last_status = status_of(&stored)?;
     let mut cancel_sent = false;
 
     loop {
@@ -139,8 +140,8 @@ pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
         // Drain the tail before the status flip so terminal readers see the
         // complete local log.
         if is_terminal_stage(stage) {
-            store.update_status(&run_id, status, Some(now_ms()), None)?;
-            if status == RunStatus::Failed {
+            let applied = store.update_status(&run_id, status, Some(now_ms()), None)?;
+            if applied && status == RunStatus::Failed {
                 if let Some(msg) = &job.status.message {
                     if let Err(err) =
                         store.set_result_markdown(&run_id, &format!("Job failed: {msg}"))
@@ -160,8 +161,7 @@ pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
             return Ok(());
         }
 
-        if status != last_status {
-            store.update_status(&run_id, status, None, None)?;
+        if status != last_status && store.update_status(&run_id, status, None, None)? {
             let cancel_requested = local_cancel_requested(&store, &run_id);
             eprintln!("supervise {run_id}: {last_status} -> {status} (stage {stage})");
             last_status = status;
@@ -204,15 +204,9 @@ fn run_status_for_stage(store: &Store, run_id: &str, cancel_sent: bool, stage: &
     }
 }
 
-/// The run's current status, parsed from the stored row. Falls back to
-/// `Running` for a row somehow holding an unrecognized string — conservative,
-/// since a fresh supervisor only ever reaches this for a non-terminal run
-/// (checked by the caller via `is_terminal`), and `Running` keeps the normal
-/// transition rules in force rather than treating the row as fresh (`Starting`
-/// would let a backend's next report regress it, which is never legal from
-/// `Running`).
-fn status_of(stored: &crate::store::StoredRun) -> RunStatus {
-    RunStatus::parse(&stored.status).unwrap_or(RunStatus::Running)
+fn status_of(stored: &crate::store::StoredRun) -> Result<RunStatus> {
+    RunStatus::parse(&stored.status)
+        .ok_or_else(|| anyhow!("Run {} has unknown status: {}", stored.id, stored.status))
 }
 
 /// Tail the job's log stream into the run's log file until told we're done.
@@ -312,7 +306,7 @@ async fn run_k8s(
         done_rx,
     ));
 
-    let mut last_status = status_of(&stored);
+    let mut last_status = status_of(&stored)?;
     let mut cancel_sent = false;
 
     loop {
@@ -328,8 +322,8 @@ async fn run_k8s(
         let status = run_status_for_stage(&store, &run_id, cancel_sent, stage);
 
         if is_terminal_stage(stage) {
-            store.update_status(&run_id, status, Some(now_ms()), None)?;
-            if status == RunStatus::Failed {
+            let applied = store.update_status(&run_id, status, Some(now_ms()), None)?;
+            if applied && status == RunStatus::Failed {
                 if let Some(msg) = &job.message {
                     if let Err(err) =
                         store.set_result_markdown(&run_id, &format!("Job failed: {msg}"))
@@ -349,8 +343,7 @@ async fn run_k8s(
             return Ok(());
         }
 
-        if status != last_status {
-            store.update_status(&run_id, status, None, None)?;
+        if status != last_status && store.update_status(&run_id, status, None, None)? {
             let cancel_requested = local_cancel_requested(&store, &run_id);
             eprintln!("supervise {run_id}: {last_status} -> {status} (stage {stage})");
             last_status = status;
@@ -472,7 +465,7 @@ async fn run_modal(
         done_rx,
     ));
 
-    let mut last_status = status_of(&stored);
+    let mut last_status = status_of(&stored)?;
     let mut cancel_sent = false;
 
     loop {
@@ -490,8 +483,8 @@ async fn run_modal(
         let status = run_status_for_stage(&store, &run_id, cancel_sent, stage);
 
         if is_terminal_stage(stage) {
-            store.update_status(&run_id, status, Some(now_ms()), None)?;
-            if status == RunStatus::Failed {
+            let applied = store.update_status(&run_id, status, Some(now_ms()), None)?;
+            if applied && status == RunStatus::Failed {
                 if let Some(msg) = &job.message {
                     if let Err(err) =
                         store.set_result_markdown(&run_id, &format!("Job failed: {msg}"))
@@ -511,8 +504,7 @@ async fn run_modal(
             return Ok(());
         }
 
-        if status != last_status {
-            store.update_status(&run_id, status, None, None)?;
+        if status != last_status && store.update_status(&run_id, status, None, None)? {
             let cancel_requested = local_cancel_requested(&store, &run_id);
             eprintln!("supervise {run_id}: {last_status} -> {status} (stage {stage})");
             last_status = status;
@@ -592,7 +584,7 @@ async fn run_ssh(
     eprintln!("supervise {run_id}: watching ssh job {host}:{dir}");
     let target = ssh::SshTarget::alias(host);
     let dir = dir.to_string();
-    watch_ssh_job(&store, status_of(&stored), target, dir, &run_id).await?;
+    watch_ssh_job(&store, status_of(&stored)?, target, dir, &run_id).await?;
     Ok(())
 }
 
@@ -632,8 +624,8 @@ async fn watch_ssh_job(
         let status = run_status_for_stage(store, run_id, cancel_sent, stage);
 
         if is_terminal_stage(stage) {
-            store.update_status(run_id, status, Some(now_ms()), None)?;
-            if status == RunStatus::Failed {
+            let applied = store.update_status(run_id, status, Some(now_ms()), None)?;
+            if applied && status == RunStatus::Failed {
                 if let Some(msg) = &job.message {
                     if let Err(err) =
                         store.set_result_markdown(run_id, &format!("Job failed: {msg}"))
@@ -653,8 +645,7 @@ async fn watch_ssh_job(
             return Ok(status);
         }
 
-        if status != last_status {
-            store.update_status(run_id, status, None, None)?;
+        if status != last_status && store.update_status(run_id, status, None, None)? {
             let cancel_requested = local_cancel_requested(store, run_id);
             eprintln!("supervise {run_id}: {last_status} -> {status} (stage {stage})");
             last_status = status;
@@ -741,15 +732,16 @@ async fn run_openresearch(
     let lifecycle = match crate::config::load_credentials().await {
         Ok(Some(c)) => c,
         _ => {
-            store.update_status(&run_id, RunStatus::Failed, Some(now_ms()), None)?;
-            store.set_result_markdown(
-                &run_id,
-                &format!(
-                    "The supervisor found no OpenResearch credentials (`orx login`), so it \
-                     could not manage box {sandbox_id} — the box may still be running; \
-                     delete it through OpenResearch."
-                ),
-            )?;
+            if store.update_status(&run_id, RunStatus::Failed, Some(now_ms()), None)? {
+                store.set_result_markdown(
+                    &run_id,
+                    &format!(
+                        "The supervisor found no OpenResearch credentials (`orx login`), so it \
+                         could not manage box {sandbox_id} — the box may still be running; \
+                         delete it through OpenResearch."
+                    ),
+                )?;
+            }
             return Err(anyhow!("no credentials for the openresearch backend"));
         }
     };
@@ -779,14 +771,19 @@ async fn run_openresearch(
                 }
                 Ok(openresearch::WaitOutcome::Failed(reason))
                 | Ok(openresearch::WaitOutcome::TimedOut(reason)) => {
-                    store.update_status(&run_id, RunStatus::Failed, Some(now_ms()), None)?;
-                    store
-                        .set_result_markdown(&run_id, &format!("Provisioning failed: {reason}"))?;
+                    if store.update_status(&run_id, RunStatus::Failed, Some(now_ms()), None)? {
+                        store.set_result_markdown(
+                            &run_id,
+                            &format!("Provisioning failed: {reason}"),
+                        )?;
+                    }
                     return Ok(());
                 }
                 Err(err) => {
-                    store.update_status(&run_id, RunStatus::Failed, Some(now_ms()), None)?;
-                    store.set_result_markdown(&run_id, &format!("Provisioning failed: {err}"))?;
+                    if store.update_status(&run_id, RunStatus::Failed, Some(now_ms()), None)? {
+                        store
+                            .set_result_markdown(&run_id, &format!("Provisioning failed: {err}"))?;
+                    }
                     teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;
                     return Ok(());
                 }
@@ -811,11 +808,12 @@ async fn run_openresearch(
         let source = match crate::compute::SourceSnapshot::from_run(&stored, &descriptor) {
             Ok(source) => source,
             Err(error) => {
-                store.update_status(&run_id, RunStatus::Failed, Some(now_ms()), None)?;
-                store.set_result_markdown(
-                    &run_id,
-                    &format!("The recorded source snapshot could not be loaded: {error}"),
-                )?;
+                if store.update_status(&run_id, RunStatus::Failed, Some(now_ms()), None)? {
+                    store.set_result_markdown(
+                        &run_id,
+                        &format!("The recorded source snapshot could not be loaded: {error}"),
+                    )?;
+                }
                 teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;
                 return Ok(());
             }
@@ -866,11 +864,15 @@ async fn run_openresearch(
             }
         }
         if let Some(err) = launch_err {
-            store.update_status(&run_id, RunStatus::Failed, Some(now_ms()), None)?;
-            store.set_result_markdown(
-                &run_id,
-                &crate::local::ssh_identity::explain_launch_failure(&sandbox_id, &err.to_string()),
-            )?;
+            if store.update_status(&run_id, RunStatus::Failed, Some(now_ms()), None)? {
+                store.set_result_markdown(
+                    &run_id,
+                    &crate::local::ssh_identity::explain_launch_failure(
+                        &sandbox_id,
+                        &err.to_string(),
+                    ),
+                )?;
+            }
             teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;
             return Ok(());
         }
@@ -883,7 +885,7 @@ async fn run_openresearch(
     // The shared ssh loop owns status and logs; the box is deleted after
     // it returns (logs are drained from the box BEFORE teardown), and even
     // when it errors.
-    let watch = watch_ssh_job(&store, status_of(&stored), target, dir, &run_id).await;
+    let watch = watch_ssh_job(&store, status_of(&stored)?, target, dir, &run_id).await;
     teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;
     watch?;
     Ok(())
@@ -938,7 +940,7 @@ async fn run_local(
         done_rx,
     ));
 
-    let mut last_status = status_of(&stored);
+    let mut last_status = status_of(&stored)?;
     let mut cancel_sent = false;
 
     loop {
@@ -947,8 +949,8 @@ async fn run_local(
         let status = run_status_for_stage(&store, &run_id, cancel_sent, stage);
 
         if is_terminal_stage(stage) {
-            store.update_status(&run_id, status, Some(now_ms()), None)?;
-            if status == RunStatus::Failed {
+            let applied = store.update_status(&run_id, status, Some(now_ms()), None)?;
+            if applied && status == RunStatus::Failed {
                 if let Some(msg) = &job.message {
                     if let Err(err) =
                         store.set_result_markdown(&run_id, &format!("Job failed: {msg}"))
@@ -968,8 +970,7 @@ async fn run_local(
             return Ok(());
         }
 
-        if status != last_status {
-            store.update_status(&run_id, status, None, None)?;
+        if status != last_status && store.update_status(&run_id, status, None, None)? {
             let cancel_requested = local_cancel_requested(&store, &run_id);
             eprintln!("supervise {run_id}: {last_status} -> {status} (stage {stage})");
             last_status = status;
@@ -1064,7 +1065,7 @@ async fn run_slurm(
         done_rx,
     ));
 
-    let mut last_status = status_of(&stored);
+    let mut last_status = status_of(&stored)?;
     let mut cancel_sent = false;
     // "GONE" (scheduler doesn't know the job, no exit_code) must persist for
     // a full minute before it's believed: it also fires during slurmctld
@@ -1101,8 +1102,8 @@ async fn run_slurm(
         let status = run_status_for_stage(&store, &run_id, cancel_sent, stage);
 
         if is_terminal_stage(stage) {
-            store.update_status(&run_id, status, Some(now_ms()), None)?;
-            if status == RunStatus::Failed {
+            let applied = store.update_status(&run_id, status, Some(now_ms()), None)?;
+            if applied && status == RunStatus::Failed {
                 if let Some(msg) = &job.message {
                     if let Err(err) =
                         store.set_result_markdown(&run_id, &format!("Job failed: {msg}"))
@@ -1122,8 +1123,7 @@ async fn run_slurm(
             return Ok(());
         }
 
-        if status != last_status {
-            store.update_status(&run_id, status, None, None)?;
+        if status != last_status && store.update_status(&run_id, status, None, None)? {
             let cancel_requested = local_cancel_requested(&store, &run_id);
             eprintln!("supervise {run_id}: {last_status} -> {status} (stage {stage})");
             last_status = status;
@@ -1172,7 +1172,7 @@ async fn run_ray(
         done_rx,
     ));
 
-    let mut last_status = status_of(&stored);
+    let mut last_status = status_of(&stored)?;
     let mut cancel_sent = false;
     // "GONE" (a 404 — the cluster no longer knows the job) must persist for a
     // full minute before it's believed: it also fires while a Ray head
@@ -1209,8 +1209,8 @@ async fn run_ray(
         let status = run_status_for_stage(&store, &run_id, cancel_sent, stage);
 
         if is_terminal_stage(stage) {
-            store.update_status(&run_id, status, Some(now_ms()), None)?;
-            if status == RunStatus::Failed {
+            let applied = store.update_status(&run_id, status, Some(now_ms()), None)?;
+            if applied && status == RunStatus::Failed {
                 if let Some(msg) = &job.message {
                     if let Err(err) =
                         store.set_result_markdown(&run_id, &format!("Job failed: {msg}"))
@@ -1230,8 +1230,7 @@ async fn run_ray(
             return Ok(());
         }
 
-        if status != last_status {
-            store.update_status(&run_id, status, None, None)?;
+        if status != last_status && store.update_status(&run_id, status, None, None)? {
             let cancel_requested = local_cancel_requested(&store, &run_id);
             eprintln!("supervise {run_id}: {last_status} -> {status} (stage {stage})");
             last_status = status;

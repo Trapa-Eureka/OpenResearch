@@ -317,7 +317,7 @@ pub fn detect_channel(exe: &Path) -> Result<InstallChannel> {
 /// not belong to something else that manages it.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn portable_dir(exe: &Path) -> Option<PathBuf> {
-    if !exe.file_name().is_some_and(|name| name == "orx.exe") {
+    if exe.file_name().is_none_or(|name| name != "orx.exe") {
         return None;
     }
     let dir = exe.parent()?;

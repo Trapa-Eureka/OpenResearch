@@ -782,13 +782,14 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
             let handle_was_persisted = current
                 .as_ref()
                 .is_some_and(|run| run.backend_json != pending_backend_json);
-            if !handle_was_persisted {
-                store.update_status(
+            if !handle_was_persisted
+                && store.update_status(
                     &run_id,
                     RunStatus::Failed,
                     Some(crate::store::now_ms()),
                     None,
-                )?;
+                )?
+            {
                 store
                     .set_result_markdown(&run_id, &format!("Compute submission failed: {error}"))?;
             }
